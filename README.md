@@ -40,6 +40,17 @@ Built with Python · Playwright · aiohttp
 </tr>
 </table>
 
+<br>
+
+<table>
+<tr>
+<td align="center"><b>🚀 253.8 MB/s — 47 files on 2.5 Gbps fiber</b></td>
+</tr>
+<tr>
+<td><img src="screenshot_speed.png" width="700"/></td>
+</tr>
+</table>
+
 </div>
 
 ---
