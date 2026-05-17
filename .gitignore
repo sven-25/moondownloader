@@ -1,0 +1,34 @@
+# Logs & telemetry
+moontech_*.log
+moontech_*.json
+crash_log.txt
+
+# Output
+output_links.txt
+failed_links.txt
+*.tmp
+
+# Optional user files
+proxies.txt
+logo.png
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Claude Code
+CLAUDE.md
+.claude/
+eni_lime.txt
+corial_style.txt
+eni_launcher.bat
+
+# Node
+node_modules/
+package-lock.json
