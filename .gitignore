@@ -12,6 +12,17 @@ failed_links.txt
 proxies.txt
 logo.png
 
+# Downloaded media (safety net if run from repo dir)
+*.rar
+*.zip
+*.7z
+*.iso
+*.mkv
+*.mp4
+
+# Playwright session cache
+.playwright-mcp/
+
 # Python
 __pycache__/
 *.pyc

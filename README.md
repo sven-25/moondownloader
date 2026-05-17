@@ -2,7 +2,7 @@
 
 # 🌙 Moon Downloader
 
-### **v14.0**
+### **v14.1**
 
 **Lightning-fast bulk file downloader** for datanodes.to & fuckingfast.co
 
@@ -10,8 +10,8 @@ Built with Python · Playwright · aiohttp
 
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org)
 [![Playwright](https://img.shields.io/badge/Playwright-Chromium-2EAD33?style=for-the-badge&logo=playwright&logoColor=white)](https://playwright.dev)
-[![Platform](https://img.shields.io/badge/Platform-Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/LeyckerS/freerdp)
-[![License](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)](https://github.com/LeyckerS/freerdp)
+[![Platform](https://img.shields.io/badge/Platform-Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/LeyckerS/moondownloader)
+[![License](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)](https://github.com/LeyckerS/moondownloader)
 
 ---
 

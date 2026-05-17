@@ -1,17 +1,12 @@
 """
-MoonTech — Hits Link Generator  v14.0
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Single-file edition. All fixes from v13, proven v12 download engine.
+MoonDownloader  v14.1
+━━━━━━━━━━━━━━━━━━━━
+Single-file GUI application for bulk downloading from datanodes.to
+and fuckingfast.co. Uses Playwright for URL extraction and aiohttp
+for high-concurrency async downloads.
 
-Changes vs v12:
-  ✓ Default 16 browsers / 48 DL streams / thread pool 12
-  ✓ Stall threshold 0.5 MB/s (was 1.5) — only truly stuck files get killed
-  ✓ Stall grace 90s, max 1 kill, 30 MB window guard — near-zero false kills
-  ✓ bytes_acc is collections.deque(maxlen=2000) — no unbounded growth
-  ✓ Shared counters protected by threading.Lock
-  ✓ ETA byte-based — no more "10s forever" bug
-  ✓ Telemetry log bug fixed (FileRecord unhashable)
-  ✓ browser_worker / do_dl extracted as App methods
+bytes_acc is collections.deque(maxlen=200000) — bounded growth.
+Shared GUI counters protected by threading.Lock (async thread ↔ tkinter thread).
 """
 import os, re, ctypes, asyncio, threading, tkinter as tk
 import math, time, random, traceback, json, datetime, collections, io
@@ -19,7 +14,6 @@ from tkinter import filedialog, scrolledtext
 from urllib.parse import urlparse, unquote
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, asdict
-from typing import Optional
 
 try:
     from PIL import Image, ImageTk
@@ -35,9 +29,7 @@ BG      = "#080b12"
 BG2     = "#0c1018"
 BG3     = "#111520"
 SURFACE = "#161c2a"
-CARD    = "#161c2a"
 BORDER  = "#1e2840"
-BORDER2 = "#263350"
 ACC     = "#00d4ff"
 ACC2    = "#0099cc"
 ACC3    = "#00ffb3"
@@ -48,8 +40,7 @@ TEXT3   = "#3d506e"
 OK      = "#00e676"
 ERR     = "#ff4d6d"
 WARN    = "#ffb547"
-INFO    = "#00d4ff"
-VERSION = "v14.0"
+VERSION = "v14.1"
 
 # ── TUNING ─────────────────────────────────────────────────────────────────────
 DEFAULT_DL_FOLDER = os.path.join(os.path.expanduser("~"), "Downloads", "datanodes")
@@ -71,18 +62,9 @@ STALL_SAFE_PCT         = 0.80
 STALL_MIN_BYTES_IN_WIN = 30 * 1024 * 1024
 STALL_MIN_FILE_BYTES   = 50 * 1024 * 1024
 
-# Early lane detection — disabled
-EARLY_GRACE_S          = 999
-EARLY_WIN_S            = 20
-EARLY_MIN_MBS          = 1.8
-EARLY_MIN_DATA         = 6 * 1024 * 1024
-EARLY_MAX_KILLS        = 0
-
-# Racing connections — open 2 connections per file, measure for 15s, keep the faster one.
-# CDN assigns lane at TCP connect time → 2 connections = 2 lane draws → keep the winner.
-RACE_ENABLED    = False  # disabled — doubles TCP connections, CDN throttles everything
-RACE_MEASURE_S  = 15      # measure both connections for this many seconds
-RACE_MIN_SIZE   = 32 * 1024 * 1024  # only race files >= 32 MB
+# Inner connection retries — separate from the user-facing extraction retry count.
+# Handles transient network errors (drops, timeouts) before giving up on a download.
+DL_INNER_RETRIES       = 4
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
@@ -202,9 +184,7 @@ class ProxyPool:
                         parts = line.split(":")
                         if len(parts) == 4:
                             # ip:port:user:pass  OR  user:pass:ip:port
-                            # Detect by checking if first part looks like IP
-                            import re as _re
-                            if _re.match(r'^\d+\.\d+\.\d+\.\d+$', parts[0]):
+                            if re.match(r'^\d+\.\d+\.\d+\.\d+$', parts[0]):
                                 # ip:port:user:pass
                                 ip, port, user, passwd = parts
                             else:
@@ -504,91 +484,9 @@ async def extract_datanodes(context, url: str) -> tuple[str|None, str|None]:
 # ── DOWNLOAD ──────────────────────────────────────────────────────────────────
 
 class _StallKill(Exception): pass
-class _RaceLoser(Exception): pass
 
 
-async def _race_connection(
-    proxy_url  : str,
-    cookies    : str,
-    race_id    : int,           # 0 or 1
-    measure_s  : float,         # how long to measure
-    speed_out  : list,          # [speed_mbs_conn0, speed_mbs_conn1]
-    winner_evt : asyncio.Event, # set by the winner to stop the loser
-    loser_evt  : asyncio.Event, # set by the loser to stop itself
-    bytes_acc  : collections.deque,
-    tmp_path   : str,
-) -> tuple[bool, float]:
-    """
-    Opens one connection, measures speed for measure_s seconds,
-    writes received data to tmp_path, reports speed in speed_out[race_id].
-    Returns (True, bytes_downloaded) if this connection won or was elected winner,
-    (False, bytes_downloaded) if this connection lost and was stopped.
-    """
-    loop   = asyncio.get_event_loop()
-    hdrs   = {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Cookie":     cookies,
-        "Referer":    "https://datanodes.to/",
-        "Connection": "keep-alive",
-    }
-
-    def _write(data: bytes):
-        with open(tmp_path, "ab") as f:
-            f.write(data)
-
-    bytes_received = 0
-    t0 = time.monotonic()
-
-    try:
-        async with _sess().get(proxy_url, headers=hdrs) as r:
-            if r.status not in (200, 206):
-                return False, 0
-
-            buf: list[bytes] = []; bufsz = 0
-            async for chunk in r.content.iter_chunked(RECV_CHUNK):
-                if not chunk:
-                    break
-                if winner_evt.is_set() and race_id != 0:
-                    # Other conn won — stop
-                    return False, bytes_received
-                if loser_evt.is_set():
-                    return False, bytes_received
-
-                now = time.monotonic()
-                bytes_received += len(chunk)
-                bytes_acc.append((now, len(chunk)))
-                buf.append(chunk); bufsz += len(chunk)
-
-                if bufsz >= WRITE_BUF:
-                    data  = b"".join(buf); buf = []; bufsz = 0
-                    await loop.run_in_executor(_POOL, _write, data)
-
-                elapsed = now - t0
-                if elapsed >= measure_s and not winner_evt.is_set():
-                    # Report speed
-                    speed_out[race_id] = bytes_received / elapsed / 1e6
-                    # If both reported, elect winner
-                    other = 1 - race_id
-                    if speed_out[other] > 0:
-                        my_speed    = speed_out[race_id]
-                        other_speed = speed_out[other]
-                        if my_speed >= other_speed:
-                            winner_evt.set()   # I win
-                        else:
-                            loser_evt.set()    # I lose
-                            return False, bytes_received
-                    # else wait for other to report
-
-            if buf:
-                await loop.run_in_executor(_POOL, _write, b"".join(buf))
-
-        return True, bytes_received
-
-    except Exception:
-        return False, bytes_received
-
-
-async def download_file_raced(
+async def download_file(
     proxy_url    : str,
     cookies      : str,
     dest         : str,
@@ -597,120 +495,15 @@ async def download_file_raced(
     telem        : Telemetry,
     kill_evt     : asyncio.Event,
     kills_so_far : int,
-    early_kills_so_far: int = 0,
-    active_dls_ref    : list = None,
 ) -> tuple[bool, str, int]:
-    """
-    Race two connections for RACE_MEASURE_S seconds, keep the faster one,
-    continue downloading with the winner. Falls back to single-stream on any error.
-    """
-    # Only race fresh downloads of big files
-    tmp = dest + ".tmp"
-    already_done = os.path.getsize(tmp) if os.path.exists(tmp) else 0
-
-    if (not RACE_ENABLED
-            or already_done > 0
-            or (rec.file_bytes > 0 and rec.file_bytes < RACE_MIN_SIZE)
-            or kills_so_far >= STALL_MAX_KILL):
-        return await download_file(
-            proxy_url, cookies, dest, rec, bytes_acc, telem, kill_evt,
-            kills_so_far, early_kills_so_far, active_dls_ref)
-
-    tmp0 = dest + ".race0"
-    tmp1 = dest + ".race1"
-    speed_out  = [0.0, 0.0]
-    winner_evt = asyncio.Event()
-    loser_evt  = asyncio.Event()
-
-    # Run both connections simultaneously
-    try:
-        task0 = asyncio.create_task(
-            _race_connection(proxy_url, cookies, 0, RACE_MEASURE_S,
-                             speed_out, winner_evt, loser_evt, bytes_acc, tmp0))
-        task1 = asyncio.create_task(
-            _race_connection(proxy_url, cookies, 1, RACE_MEASURE_S,
-                             speed_out, winner_evt, loser_evt, bytes_acc, tmp1))
-
-        # Wait for both to finish their race phase
-        done, pending = await asyncio.wait(
-            [task0, task1],
-            timeout=RACE_MEASURE_S + 10,
-            return_when=asyncio.ALL_COMPLETED
-        )
-    except Exception:
-        for t in [tmp0, tmp1]:
-            try: os.remove(t)
-            except: pass
-        return await download_file(
-            proxy_url, cookies, dest, rec, bytes_acc, telem, kill_evt,
-            kills_so_far, early_kills_so_far, active_dls_ref)
-
-    # Determine winner by speed
-    spd0, spd1 = speed_out[0], speed_out[1]
-    winner_spd  = max(spd0, spd1)
-    winner_tmp  = tmp0 if spd0 >= spd1 else tmp1
-    loser_tmp   = tmp1 if spd0 >= spd1 else tmp0
-
-    # Clean up loser file
-    try: os.remove(loser_tmp)
-    except: pass
-
-    if winner_spd == 0:
-        # Both failed — fall back
-        try: os.remove(winner_tmp)
-        except: pass
-        rec.notes.append("race both failed, falling back")
-        return await download_file(
-            proxy_url, cookies, dest, rec, bytes_acc, telem, kill_evt,
-            kills_so_far, early_kills_so_far, active_dls_ref)
-
-    winner_bytes = os.path.getsize(winner_tmp) if os.path.exists(winner_tmp) else 0
-    loser_label  = f"conn{'1' if spd0>=spd1 else '0'}"
-    rec.notes.append(
-        f"race: conn0={spd0:.1f} MB/s conn1={spd1:.1f} MB/s → "
-        f"{'conn0' if spd0>=spd1 else 'conn1'} wins"
-    )
-
-    # Rename winner tmp to standard .tmp and continue with single-stream resume
-    try:
-        if os.path.exists(tmp):
-            os.remove(tmp)
-        os.rename(winner_tmp, tmp)
-    except Exception:
-        try: os.remove(winner_tmp)
-        except: pass
-        return await download_file(
-            proxy_url, cookies, dest, rec, bytes_acc, telem, kill_evt,
-            kills_so_far, early_kills_so_far, active_dls_ref)
-
-    # Continue download from where the winner left off (resume)
-    return await download_file(
-        proxy_url, cookies, dest, rec, bytes_acc, telem, kill_evt,
-        kills_so_far, early_kills_so_far, active_dls_ref)
-
-
-async def download_file(
-    proxy_url        : str,
-    cookies          : str,
-    dest             : str,
-    rec              : FileRecord,
-    bytes_acc        : collections.deque,
-    telem            : Telemetry,
-    kill_evt         : asyncio.Event,
-    kills_so_far     : int,
-    early_kills_so_far: int = 0,   # separate counter for early lane kills
-    active_dls_ref   : list = None, # [int] — shared active download count
-) -> tuple[bool, str, int]:
-
-    tmp  = dest + ".tmp"
-    loop = asyncio.get_event_loop()
-    detect       = kills_so_far < STALL_MAX_KILL
-    early_detect = early_kills_so_far < EARLY_MAX_KILLS
-    early_checked = False   # only do one early check per attempt
+    """Download a single file with resume support, stall detection, and proxy rotation."""
+    tmp    = dest + ".tmp"
+    loop   = asyncio.get_running_loop()
+    detect = kills_so_far < STALL_MAX_KILL
 
     def _write(f, data: bytes): f.write(data)
 
-    for att in range(4):
+    for att in range(DL_INNER_RETRIES):
         resume = os.path.getsize(tmp) if os.path.exists(tmp) else 0
         ref = "https://fuckingfast.co/" if "fuckingfast" in proxy_url else "https://datanodes.to/"
         hdrs = {
@@ -757,7 +550,6 @@ async def download_file(
                 speed_win  : collections.deque = collections.deque(maxlen=8000)
                 downloaded = resume
                 last_check = dl_t0
-                early_checked = False
 
                 try:
                     buf: list[bytes] = []; bufsz = 0
@@ -775,32 +567,7 @@ async def download_file(
 
                         elapsed = now - dl_t0
 
-                        # ── Early lane detection (25s) ────────────────────────
-                        # Only on fresh downloads (no resume), only if many
-                        # other downloads are still active, only once per attempt.
-                        if (early_detect and not early_checked
-                                and elapsed >= EARLY_GRACE_S
-                                and resume == 0
-                                and file_size >= STALL_MIN_FILE_BYTES):
-                            early_checked = True
-                            # Measure speed over the early window
-                            cutoff = now - EARLY_WIN_S
-                            win = [(t, b) for t, b in speed_win if t > cutoff]
-                            win_bytes = sum(b for _, b in win)
-                            if (win_bytes >= EARLY_MIN_DATA and len(win) > 1):
-                                win_s = max(now - win[0][0], 1.0)
-                                spd   = win_bytes / win_s / 1e6
-                                # Only kill if other downloads are still active
-                                # (so this file can get a fresh lane while
-                                # other files keep the bandwidth busy)
-                                active = active_dls_ref[0] if active_dls_ref else 0
-                                if spd < EARLY_MIN_MBS and active >= 4:
-                                    telem.stall(rec.filename, spd, downloaded,
-                                        f"slow lane ({spd:.2f} MB/s at {elapsed:.0f}s) → early re-extract")
-                                    kill_evt.set()
-                                    raise _StallKill()
-
-                        # ── Standard stall detection (90s) ───────────────────
+                        # ── Stall detection ──────────────────────────────────
                         if effective_detect and (now - last_check) >= STALL_CHECK_S:
                             last_check = now
                             if elapsed >= STALL_GRACE_S:
@@ -835,16 +602,16 @@ async def download_file(
             return False, "stall_killed", downloaded
         except (aiohttp.ClientPayloadError, aiohttp.ServerDisconnectedError):
             rec.notes.append(f"connection dropped att {att+1}")
-            if att < 3: await asyncio.sleep(0.5*(att+1)); continue
+            if att < DL_INNER_RETRIES - 1: await asyncio.sleep(0.5*(att+1)); continue
             return False, "connection dropped", downloaded
         except asyncio.TimeoutError:
             rec.notes.append(f"timeout att {att+1}")
-            if att < 3: await asyncio.sleep(1+att); continue
+            if att < DL_INNER_RETRIES - 1: await asyncio.sleep(1+att); continue
             return False, "timeout", downloaded
         except Exception as e:
             err = str(e)
             rec.notes.append(f"error att {att+1}: {err}")
-            if att < 3 and ("ContentLengthError" in err or "not enough data" in err.lower()):
+            if att < DL_INNER_RETRIES - 1 and ("ContentLengthError" in err or "not enough data" in err.lower()):
                 await asyncio.sleep(0.5*(att+1)); continue
             return False, err, downloaded
 
@@ -1327,8 +1094,8 @@ class App(tk.Tk):
 
     # ── Async core (unchanged) ─────────────────────────────────────────────
     async def _do_dl(self, proxy_url, cookies, filename, orig_url, rec,
-                     kill_counts, early_kill_counts, dl_sem, dest_folder, telem, mark_done_fn,
-                     failed_urls, q, dl_times, dl_times_lock):
+                     kill_counts, dl_sem, dest_folder, telem, mark_done_fn,
+                     failed_urls, q):
         async with dl_sem:
             self._inc("_dls")
             rec.dl_start = time.monotonic(); rec.status = "downloading"
@@ -1340,35 +1107,25 @@ class App(tk.Tk):
                 rec.status="ok"; rec.dl_s=0.0
                 mark_done_fn(); self._inc("_dl_done"); self._inc("_dls",-1); return
 
-            kc  = kill_counts.get(orig_url, 0)
-            ekc = early_kill_counts.get(orig_url, 0)
+            kc       = kill_counts.get(orig_url, 0)
             kill_evt = asyncio.Event()
-            active_dls_ref = [self._get("_dls")]
-            ok, msg, bytes_done = await download_file_raced(
-                proxy_url, cookies, dest, rec, self._bytes_acc, telem, kill_evt, kc,
-                early_kills_so_far=ekc, active_dls_ref=active_dls_ref)
+            ok, msg, bytes_done = await download_file(
+                proxy_url, cookies, dest, rec, self._bytes_acc, telem, kill_evt, kc)
             rec.dl_s = max(time.monotonic()-rec.dl_start, 0.001)
 
             if ok:
-                async with dl_times_lock:
-                    dl_times.append(rec.dl_s)
                 self._inc("_ok")
                 spd = f"  ({rec.avg_mbs:.1f} MB/s)" if rec.avg_mbs > 0 else ""
                 self.log(f"    ✓  Saved: {filename}{spd}", "ok")
                 rec.status="ok"; mark_done_fn(); self._inc("_dl_done")
             elif msg == "stall_killed":
                 done_mb = bytes_done//(1<<20)
-                if ekc < EARLY_MAX_KILLS and (time.monotonic()-rec.dl_start) < STALL_GRACE_S:
-                    new_ekc = ekc + 1; early_kill_counts[orig_url] = new_ekc
-                    self._inc("_kills"); rec.stall_kills += 1
-                    self.log(f"    ⚡  Lane kill #{new_ekc}: {filename}  ({done_mb}MB)", "kill")
+                new_kc = kc + 1; kill_counts[orig_url] = new_kc
+                self._inc("_kills"); rec.stall_kills += 1
+                if new_kc <= STALL_MAX_KILL:
+                    self.log(f"    ⚡  Kill #{new_kc}: {filename}  ({done_mb}MB) → re-extract", "kill")
                 else:
-                    new_kc = kc + 1; kill_counts[orig_url] = new_kc
-                    self._inc("_kills"); rec.stall_kills += 1
-                    if new_kc <= STALL_MAX_KILL:
-                        self.log(f"    ⚡  Kill #{new_kc}: {filename}  ({done_mb}MB) → re-extract", "kill")
-                    else:
-                        self.log(f"    ⚡  Kill #{new_kc}: {filename}  ({done_mb}MB) → continue", "warn")
+                    self.log(f"    ⚡  Kill #{new_kc}: {filename}  ({done_mb}MB) → continue", "warn")
                 rec.queued_at=time.monotonic(); rec.status="pending"
                 await q.put((orig_url, 1, rec))
                 self._inc("_dls",-1); return
@@ -1381,9 +1138,8 @@ class App(tk.Tk):
             self._inc("_dls",-1)
 
     async def _browser_worker(self, browser, wid, q, dl_sem, all_done, mark_done_fn,
-                               kill_counts, early_kill_counts, all_tasks, tasks_lock,
-                               output_links, failed_urls, dest_folder, mode, max_retries, telem,
-                               dl_times, dl_times_lock):
+                               kill_counts, all_tasks, tasks_lock,
+                               output_links, failed_urls, dest_folder, mode, max_retries, telem):
         self._inc("_browsers")
         my_tasks = []
         try:
@@ -1419,9 +1175,9 @@ class App(tk.Tk):
                         else:
                             self.log(f"    ↓  {filename}", "dim")
                             async def _task(pu=link, fn=filename, ou=url, r=rec):
-                                await self._do_dl(pu, "", fn, ou, r, kill_counts, early_kill_counts,
+                                await self._do_dl(pu, "", fn, ou, r, kill_counts,
                                                    dl_sem, dest_folder, telem, mark_done_fn,
-                                                   failed_urls, q, dl_times, dl_times_lock)
+                                                   failed_urls, q)
                             t = asyncio.create_task(_task())
                             my_tasks.append(t)
                             async with tasks_lock: all_tasks.append(t)
@@ -1448,9 +1204,9 @@ class App(tk.Tk):
                         else:
                             self.log(f"    ↓  {filename}", "dim")
                             async def _task(pu=proxy_url, co=cookies, fn=filename, ou=url, r=rec):
-                                await self._do_dl(pu, co, fn, ou, r, kill_counts, early_kill_counts,
+                                await self._do_dl(pu, co, fn, ou, r, kill_counts,
                                                    dl_sem, dest_folder, telem, mark_done_fn,
-                                                   failed_urls, q, dl_times, dl_times_lock)
+                                                   failed_urls, q)
                             t = asyncio.create_task(_task())
                             my_tasks.append(t)
                             async with tasks_lock: all_tasks.append(t)
@@ -1486,14 +1242,11 @@ class App(tk.Tk):
         failed_urls  : list[str] = []
         all_tasks    : list      = []
         tasks_lock   = asyncio.Lock()
-        kill_counts       : dict[str,int] = {}
-        early_kill_counts : dict[str,int] = {}
+        kill_counts  : dict[str,int] = {}
         dest_folder  = self._out_folder.get()
         mode         = self._mode.get()
         n_done       = 0
         all_done     = asyncio.Event()
-        dl_times     : list[float] = []
-        dl_times_lock = asyncio.Lock()
 
         def mark_done():
             nonlocal n_done
@@ -1530,9 +1283,8 @@ class App(tk.Tk):
                 try:
                     await self._browser_worker(
                         b, wid, q, dl_sem, all_done, mark_done,
-                        kill_counts, early_kill_counts, all_tasks, tasks_lock,
-                        output_links, failed_urls, dest_folder, mode, max_retries, telem,
-                        dl_times, dl_times_lock)
+                        kill_counts, all_tasks, tasks_lock,
+                        output_links, failed_urls, dest_folder, mode, max_retries, telem)
                 finally:
                     try: await b.close()
                     except Exception: pass
@@ -1558,7 +1310,7 @@ class App(tk.Tk):
             self.log(f"⚠  Log save error: {e}", "warn")
 
         if output_links and mode == "links":
-            with open(os.path.join(base,"output_links.txt"),"a",encoding="utf-8") as f:
+            with open(os.path.join(base,"output_links.txt"),"w",encoding="utf-8") as f:
                 f.write("\n".join(output_links)+"\n")
             self.log("✓  Links → output_links.txt", "info")
         if failed_urls:

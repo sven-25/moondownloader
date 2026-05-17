@@ -1,18 +1,17 @@
 """
-MoonDownloader CLI  —  headless version for server / multi-IP deployment
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MoonDownloader CLI  v14.1
+━━━━━━━━━━━━━━━━━━━━━━━━
+Headless version for server / multi-IP deployment.
+
 Usage:
     python gen_cli.py --urls links.txt --output /path/to/downloads
     python gen_cli.py --urls links.txt --output ./dl --browsers 8 --streams 24 --retries 3
-
-All tuning constants are identical to gen_1.py (GUI version).
 """
 import os, re, sys, asyncio, threading, argparse, json, datetime
-import math, time, random, traceback, collections, io
+import time, random, traceback, collections, io
 from urllib.parse import urlparse, unquote
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, asdict
-from typing import Optional
 
 import aiohttp
 from playwright.async_api import async_playwright
@@ -31,12 +30,7 @@ STALL_SAFE_PCT         = 0.80
 STALL_MIN_BYTES_IN_WIN = 30 * 1024 * 1024
 STALL_MIN_FILE_BYTES   = 50 * 1024 * 1024
 
-EARLY_GRACE_S          = 999
-EARLY_MAX_KILLS        = 0
-
-RACE_ENABLED           = False
-RACE_MEASURE_S         = 15
-RACE_MIN_SIZE          = 32 * 1024 * 1024
+DL_INNER_RETRIES       = 4
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
@@ -369,22 +363,22 @@ async def extract_datanodes(context, url: str) -> tuple[str|None, str|None]:
 class _StallKill(Exception): pass
 
 async def download_file(
-    proxy_url        : str,
-    cookies          : str,
-    dest             : str,
-    rec              : FileRecord,
-    bytes_acc        : collections.deque,
-    kill_evt         : asyncio.Event,
-    kills_so_far     : int,
+    proxy_url    : str,
+    cookies      : str,
+    dest         : str,
+    rec          : FileRecord,
+    bytes_acc    : collections.deque,
+    kill_evt     : asyncio.Event,
+    kills_so_far : int,
 ) -> tuple[bool, str, int]:
-
-    tmp  = dest + ".tmp"
-    loop = asyncio.get_event_loop()
+    """Download a single file with resume support, stall detection, and proxy rotation."""
+    tmp    = dest + ".tmp"
+    loop   = asyncio.get_running_loop()
     detect = kills_so_far < STALL_MAX_KILL
 
     def _write(f, data: bytes): f.write(data)
 
-    for att in range(4):
+    for att in range(DL_INNER_RETRIES):
         resume = os.path.getsize(tmp) if os.path.exists(tmp) else 0
         ref = "https://fuckingfast.co/" if "fuckingfast" in proxy_url else "https://datanodes.to/"
         hdrs = {
@@ -471,16 +465,16 @@ async def download_file(
             return False, "stall_killed", downloaded
         except (aiohttp.ClientPayloadError, aiohttp.ServerDisconnectedError):
             rec.notes.append(f"connection dropped att {att+1}")
-            if att < 3: await asyncio.sleep(0.5*(att+1)); continue
+            if att < DL_INNER_RETRIES - 1: await asyncio.sleep(0.5*(att+1)); continue
             return False, "connection dropped", downloaded
         except asyncio.TimeoutError:
             rec.notes.append(f"timeout att {att+1}")
-            if att < 3: await asyncio.sleep(1+att); continue
+            if att < DL_INNER_RETRIES - 1: await asyncio.sleep(1+att); continue
             return False, "timeout", downloaded
         except Exception as e:
             err = str(e)
             rec.notes.append(f"error att {att+1}: {err}")
-            if att < 3 and ("ContentLengthError" in err or "not enough data" in err.lower()):
+            if att < DL_INNER_RETRIES - 1 and ("ContentLengthError" in err or "not enough data" in err.lower()):
                 await asyncio.sleep(0.5*(att+1)); continue
             return False, err, downloaded
 
@@ -502,7 +496,6 @@ async def run(urls: list[str], output_dir: str, n_workers: int,
     q             = asyncio.Queue()
     dl_sem        = asyncio.Semaphore(max_dl)
     failed_urls   : list[str]   = []
-    output_links  : list[str]   = []
     all_tasks     : list        = []
     tasks_lock    = asyncio.Lock()
     kill_counts   : dict[str,int] = {}
@@ -703,12 +696,6 @@ async def run(urls: list[str], output_dir: str, n_workers: int,
         with open(fp, "w", encoding="utf-8") as f:
             f.write("\n".join(failed_urls) + "\n")
         print(f"Failed ({len(failed_urls)}): {fp}")
-
-    if output_links:
-        lf = os.path.join(base, "output_links.txt")
-        with open(lf, "w", encoding="utf-8") as f:
-            f.write("\n".join(output_links) + "\n")
-        print(f"Links saved: {lf}")
 
 # ── ENTRY POINT ────────────────────────────────────────────────────────────────
 def main():
