@@ -1,0 +1,32 @@
+name: Lint
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**.py"
+      - ".github/workflows/lint.yml"
+  pull_request:
+    paths:
+      - "**.py"
+
+jobs:
+  syntax-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Byte-compile all Python files
+        run: |
+          python -m compileall -q gen_1.py gen_cli.py
+
+      - name: Check for syntax errors with py_compile
+        run: |
+          python -c "import py_compile; py_compile.compile('gen_1.py', doraise=True)"
+          python -c "import py_compile; py_compile.compile('gen_cli.py', doraise=True)"
