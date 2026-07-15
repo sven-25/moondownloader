@@ -43,3 +43,19 @@ eni_launcher.bat
 # Node
 node_modules/
 package-lock.json
+
+
+# macOS
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+.AppleDouble
+
+# Windows extras
+Thumbs.db
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
